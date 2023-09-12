@@ -1,0 +1,412 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from scipy.stats import norm
+from scipy.special import ndtr
+from scipy.optimize import minimize
+import matplotlib.pyplot as plt
+from scipy import interpolate
+
+
+def svi_raw(parameters, k):
+    """ SVI raw parametrization for total implied variance
+    k: log forward moneyness for which total variance is evaluated
+    
+    :parameter a:       vertical translation of the smile
+    :parameter b:       tightens the smile
+    :parameter m:       translates the smile to the right
+    :parameter rho:     counterclockwise rotation of the smile
+    :parameter sigma:   controls the ATM curvature of the smile
+    """
+    a, b, m, rho, sigma = parameters
+    w = a + b * (rho * (k - m) + np.sqrt((k - m)**2 + sigma**2))
+    return w
+
+
+def svi_der_1(parameters, k):
+    """ 
+    first order derivative of the SVI raw total implied variance w.r.t  k
+    
+    """
+    a, b, m, rho, sigma = parameters
+    der = b * ( rho + (k - m) / ( np.sqrt((k - m)**2 + sigma**2) ) )
+    return der
+
+
+def svi_der_2(parameters, k):
+    """ 
+    second order derivative of the SVI raw total implied variance w.r.t  k
+    
+    """
+    a, b, m, rho, sigma = parameters
+    numer = b * sigma**2
+    denom = ((k - m)**2 + sigma**2)**1.5
+    der = numer / denom
+    return der
+    
+    
+def g_function(parameters, k):
+    """ 
+    key function to determine butterfly arbitrage 
+    
+    """
+    w = svi_raw(parameters, k)
+    w1 = svi_der_1(parameters, k)
+    w2 = svi_der_2(parameters, k)
+    g = (1 - 0.5 * (k * w1 / w))**2 - (0.25 * w1**2) * ((1 / w) + 0.25) + 0.5 * w2
+    return g, w
+
+
+def density_function(parameters, k):
+    """ 
+    Risk-Neutal Probability Density Function 
+    
+    """
+    g, w = g_function(parameters, k)
+    d2 = -k / np.sqrt(w) - np.sqrt(w) / 2
+    density = g / np.sqrt(2 * np.pi * w) * np.exp(-0.5 * d2**2)
+    return density
+
+
+def svi_natural(parameters, k):
+    """ SVI natural parametrization for total implied variance
+    k: log forward moneyness for which total variance is evaluated
+    
+    :parameter delta:
+    :parameter mu:
+    :parameter rho:
+    :parameter omega:
+    :parameter zeta:
+    """
+    delta, mu, rho, omega, zeta = parameters
+    w = delta + (omega / 2) * (1 + zeta * rho * (k-mu)) + np.sqrt((zeta * (k - mu) + rho)**2 + (1 - rho**2))
+    return w
+
+
+def convert_natural_to_raw(parameters_natural):
+    """ 
+    Converts SVI natural parameters to SVI raw parameters
+    
+    """
+    delta, mu, rho, omega, zeta = parameters_natural
+    
+    a = delta + (omega / 2) * (1 - rho**2)
+    b = (omega * zeta) / 2
+    m = mu - (rho / zeta)
+    sigma = np.sqrt(1 - rho**2) / zeta
+    parameters_raw = np.array([a, b, m, rho, sigma])
+    return parameters_raw
+
+
+def convert_raw_to_natural(parameters_raw):
+    """ 
+    Converts SVI natural parameters to SVI raw parameters
+    
+    """
+    a, b, m, rho, sigma = parameters_raw
+    zeta = np.sqrt(1 - rho**2) / sigma
+    omega = (2 * b * sigma) / np.sqrt(1 - rho**2)
+    mu = m + (rho * sigma) / np.sqrt(1 - rho**2)
+    delta = a - (omega / 2) * (1 - rho**2)
+    parameters_natural = np.array([delta, mu, rho, omega, zeta])
+    return parameters_natural
+
+
+def svi_jump_wings(parameters, k, t):
+    """ SVI Jump-Wings parametrization for total implied variance
+    k: log forward moneyness for which total variance is evaluated
+    t: the time slice
+    
+    :parameter v:       The ATM variance
+    :parameter psi:     The ATM skew
+    :parameter p:       The slope of the left (put) wing
+    :parameter c:       The slope of the right (call) wing
+    :parameter v_tilde: The minimum implied variance
+    """
+    raw_parameters = convert_jumpwing_to_raw(parameters, t)
+    w = svi_raw(raw_parameters)
+    return w
+
+
+def convert_raw_to_jumpwing(parameters_raw, t):
+    """ 
+    Converts SVI raw parameters to SVI Jump-Wings parameters for a given time slice t
+    
+    """
+    a, b, m, rho, sigma = parameters_raw
+    w = a + b * (-rho * m + np.sqrt(m**2 + sigma**2))
+    v = w / t
+    psi = 1 / np.sqrt(w) * b / 2 * (-m / np.sqrt(m**2 + sigma**2) + rho)
+    p = 1 / np.sqrt(w) * b * (1 - rho)
+    c = 1 / np.sqrt(w) * b * (1 + rho)
+    v_tilde = 1 / t * (a + b * sigma * np.sqrt(1 - rho**2))
+    parameters_jw = np.array([v, psi, p, c, v_tilde])
+    return parameters_jw
+    
+
+def convert_jumpwing_to_raw(parameters_jw, t):
+    """ 
+    Converts SVI Jump-Wings parameters to SVI raw parameters  for a given time slice t
+    
+    """
+    v, psi, p, c, v_tilde = parameters_jw
+    w = v * t
+    b = np.sqrt(w) / 2 * (c + p)
+    rho = 1 - p * np.sqrt(w) / b
+    beta = rho - 2 * psi * np.sqrt(w) / b
+    alpha = np.sign(beta) * np.sqrt(1 / beta**2 - 1)
+    m = (v - v_tilde) * t / (b * (-rho + np.sign(alpha) * np.sqrt(1 + alpha**2) - alpha * np.sqrt(1 - rho**2)))
+    sigma = alpha * m
+    temp = (v_tilde * t - w) / b / (np.sqrt(1 - rho**2) - 1)
+    sigma[m==0] = temp[m==0]
+    a = v_tilde * t - b * sigma * np.sqrt(1 - rho**2)
+    sigma[sigma < 0] = 0
+    parameters_raw = np.array([a, b, m, rho, sigma])
+    return parameters_raw
+
+
+def expand_jw_parameters(parameters):
+    """ 
+    modifies the call wing (c) and the minimum variance (v_tilde) of SVI-jump-wings parameters
+    to get a smile guaranteed to be free of butterfly arbitrage
+    
+    """
+    p4 = parameters[2] + 2 * parameters[1]
+    p5 = parameters[0] * 4 * parameters[2] * p4 / (parameters[2] + p4)**2
+    parameters = np.append(parameters[:3], [p4, p5])
+    return parameters
+
+
+def black_scholes_model(S, K, T, r, q, sigma, phi, vega=False):
+    """
+    Black-Scholes function for valuing vanilla european options
+    input: point values or vectors
+    phi: takes on either 1 or -1
+        phi = 1 for call options and -1 for put options
+    vega: bool
+        determines if the function returns the vega in addition to the price
+    """
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / np.maximum(0.0005, (sigma * np.sqrt(T)))
+    d2 = d1 - (sigma * np.sqrt(T))
+    val = phi * ( S * np.exp(-q * T) * ndtr(phi * d1) - (K * np.exp(-r * T) * ndtr(phi * d2)) )
+    if vega:
+        vg = S * norm._pdf(d1) * np.sqrt(T)
+        return val, vg
+    return val
+
+
+def implied_volatility(opt_prcs, S, Ks, T, r, q, phis):
+    data = np.column_stack((opt_prcs, Ks, phis))
+    inds = np.arange(0, len(data), dtype=np.int32)
+    ivs = np.zeros(len(phis))
+    sigmas_est = 0.5 * np.ones(len(phis)) # start guess
+    max_iter = 50
+    for i in range(max_iter):
+        prc_est, vega = black_scholes_model(S, data[:,1], T, r, q, sigmas_est, data[:,2], vega=True)
+        diff = data[:,0] - prc_est
+        goal_flag = abs(diff) < 1e-5
+        if np.any(goal_flag):
+            found_inds = inds[goal_flag]
+            ivs[found_inds] = sigmas_est[goal_flag]
+            inds = inds[~goal_flag]
+            data = data[~goal_flag]
+            sigmas_est = sigmas_est[~goal_flag] + (diff[~goal_flag] / vega[~goal_flag])
+            
+        else:
+            sigmas_est = sigmas_est + (diff / vega)
+    if len(sigmas_est)!=0: ivs[inds] = sigmas_est
+    return ivs
+
+
+# objective function to determine the forward prices and discount factors
+def fwds_obj_func(params, data, df):
+    fwd = params
+    i_fit = df * (fwd - data['strike'].values)
+    error = np.sum( (i_fit - data['i_mid'].values)**2 )
+    return error
+
+
+
+# objective function to calibrate raw svi parametrization to market implied volatilities
+def svi_obj_fun(x0, ks, observed_vols, t):
+    ws = svi_raw(x0, ks)
+    model_vols = np.sqrt(ws / t)
+    diff = np.sum((model_vols - observed_vols)**2)
+    return diff
+
+
+# butterfly arbitrage constraint function
+def butterfly_constr(params):
+    """ a slice is free of butterfly arbitrage if the corresponding density is non-negative"""
+    gs, _ = g_function(params, standard_ks)
+    return gs
+
+
+# calendar spread arbitrage constraint function
+def calendar_constr(params, prev_parameters=None):
+    """ 
+    a volatility surface is free of calendar spread arbitrage if there are no
+    crossed lines on a total variance plot
+    """
+    if prev_parameters is None: return np.zeros(len(standard_ks))
+    diff = svi_raw(params, standard_ks) - svi_raw(prev_parameters, standard_ks)
+    return diff
+
+
+# function to run the optimization
+def run_opt(x0, ks, observed_vols, t, cons, bnds):
+    res = minimize(svi_obj_fun, x0, args=(ks, observed_vols, t), 
+                   method='SLSQP', bounds=bnds, constraints=cons)
+    return res.x
+
+
+def read_discount_curve(path):
+    """
+    reads the discount curve and returns a loglinear interpolation function
+    
+    """
+    disc_curve = pd.read_excel(path)
+    ts = np.insert(disc_curve['Tenor'].values, 0, 0., axis=0)
+    dfs = np.insert(disc_curve['DF'].values, 0, 1., axis=0)
+    return interpolate.interp1d(ts, np.log(dfs), kind='linear', fill_value='extrapolate')
+
+
+# Get Option-Chain Data
+today = pd.to_datetime('today').normalize()
+ticker = '^SPX'
+S0 = yf.Ticker(ticker).fast_info['lastPrice']
+exp_dates = yf.Ticker(ticker).options
+tenors = []
+
+option_data = pd.DataFrame()
+for i in range(len(exp_dates)):
+    date = exp_dates[i]
+    option_chains = yf.Ticker(ticker).option_chain(date)
+    calls = option_chains[0]
+    calls['Option Type'] = 'CALL'
+    calls['Per_Mon'] = (S0 - calls['strike']) / calls['strike']
+    puts = option_chains[1]
+    puts['Option Type'] = 'PUT'
+    puts['Per_Mon'] = (puts['strike'] - S0) / puts['strike']
+    total_data = pd.concat([calls, puts])
+    total_data = total_data[['Option Type', 'strike', 'Per_Mon', 'lastPrice', 'bid', 'ask', 'impliedVolatility']]
+    tenor = (pd.to_datetime(exp_dates[i]) - today).days / 365
+    tenors.append(tenor)
+    total_data['Tenor'] = tenor
+    option_data = pd.concat([option_data, total_data], ignore_index=True)
+option_data = option_data.rename(columns={'impliedVolatility' : 'yf_IV'})    
+    
+
+# drop rows with zero bid or zero ask or both
+option_data = option_data[(option_data[['bid','ask']] != 0).all(axis=1)]
+
+# calculate average option price
+option_data['mid'] = (option_data['bid'] + option_data['ask']) / 2
+
+# drop rows with average price less than 50 cents
+option_data = option_data[option_data['mid'] > 0.5] 
+
+
+path = 'discount_curve.xlsx'
+log_df_interp = read_discount_curve(path)
+
+
+tenors = option_data['Tenor'].unique()
+tenors = tenors[tenors > 0]
+svi_bnds_dict = {}
+k_arr_dict = {}
+guesses_dict = {}
+vols_dict = {}
+n_tenors = np.array([])
+for i in range(len(tenors)):
+    t = tenors[i]
+    t_data = option_data[option_data['Tenor']==t]
+    # interpolate discount factor and find the forward price
+    df = np.exp(log_df_interp(t))
+    temp_c = t_data[t_data['Option Type']=='CALL'].rename(columns={'mid' : 'mid_call'})
+    temp_p = t_data[t_data['Option Type']=='PUT'].rename(columns={'mid' : 'mid_put'})
+    temp = temp_p.merge(temp_c, on='strike')[['strike', 'mid_call', 'mid_put']]
+    temp['i_mid'] = temp['mid_call'] - temp['mid_put']
+    if len(temp) < 4: continue
+    temp = temp.sort_values(by='i_mid', key=abs, ignore_index=True)[:6]    
+    fwd_guess = np.mean(temp['i_mid'] + temp['strike'])
+    res = minimize(fwds_obj_func, x0=fwd_guess, args=(temp, df))
+    fwd = res.x[0]
+    r = np.log(df) / -t # risk-free rate
+    q = (np.log(df) / -t) - np.log(fwd / S0) / t # dividend yield
+    # select only OTM options
+    temp = t_data.loc[~(t_data['Per_Mon'] > 0)].reset_index(drop=True)
+    if (len(temp)) < 3: continue
+    # calculate implied volatility
+    temp = temp.sort_values(by=['strike']).reset_index(drop=True)
+    phis = np.ones(len(temp))
+    phis[temp[temp['Option Type']=='PUT'].index] = -1        
+    temp['IV'] = implied_volatility(temp['mid'].values, S0, temp['strike'].values, t, r, q, phis)
+    temp.replace([np.inf, -np.inf], np.nan, inplace=True)
+    temp = temp.dropna(subset=['IV'], how='any', axis=0).reset_index(drop=True)
+    temp['w'] = t * temp['IV']**2
+    n_tenors = np.append(n_tenors, t)
+    # Get SVI inputs for calibration
+    k_arr_dict[t] = np.log(temp['strike'].values / fwd)
+    vols_dict[t] = temp['IV'].values
+    svi_bnds_dict[t] = [(1e-5, temp['w'].max()), (1e-3, 1), (-3, 3), (-1, 1), (1e-2, 1)]
+    guesses_dict[t] = [0.5 * t * temp['IV'].min()**2, 0.1, 0.1, -0.5, 0.1]
+    
+
+# filter out tenors close to 1W, 1M, 3M, 6M, 1Y, 2Y, 3Y, 4Y
+std_tenors = np.array([0.0192, 0.0833, 0.25, 0.5, 1, 2, 3, 4, 5])
+temp = list(k_arr_dict.keys())
+tenors = []
+for i in range(len(std_tenors)):
+    idx = (np.abs(n_tenors - std_tenors[i])).argmin()
+    if not n_tenors[idx] in tenors: tenors.append(n_tenors[idx])
+    
+    
+
+# calibrate slice from the lowest tenor up, with constraints for butterfly and calendar spread arbitrage
+svi_params = np.zeros((len(tenors), 5))
+standard_ks = np.linspace(-1.5, 1.5, 20)
+
+for i in range(len(tenors)):
+    t = tenors[i]
+    bnds = tuple(svi_bnds_dict[t])
+    ks = k_arr_dict[t]
+    observed_vols = vols_dict[t]
+    x0 = guesses_dict[t]
+    prev_parameters = svi_params[i-1] if i != 0 else None
+    cons=({'type': 'ineq', 'fun': butterfly_constr}, 
+        {'type': 'ineq', 'fun': calendar_constr, 'args': (prev_parameters,)})
+    #prev_params = svi_params[i-1] if i != 0 else None
+    for j in range(2):
+        x0 = run_opt(x0, ks, observed_vols, t, cons, bnds)
+    svi_params[i] = x0
+    model_vols = np.sqrt( svi_raw(svi_params[i], ks) / t )
+    plt.plot(ks, observed_vols, 'bo', label='observed')
+    plt.plot(ks, model_vols, 'r--', label='SVI-model')
+    plt.xlabel('Log-Forward-Moneyness')
+    plt.ylabel('volatility')
+    plt.title('t = ' + str(round(tenors[i], 4)))
+    plt.grid()
+    plt.legend()
+    plt.show()
+
+
+# plot total variances to check that there are no crossed lines
+total_variances = np.zeros((len(tenors), len(standard_ks)))
+for i in range(len(tenors)):
+    total_variances[i] = svi_raw(svi_params[i], standard_ks)
+    plt.plot(standard_ks, total_variances[i])
+plt.grid()
+plt.show()
+
+
+# plot the g function for each time slice
+for i in range(len(tenors)):
+    gs,_ = g_function(svi_params[i], standard_ks)
+    plt.plot(standard_ks, gs, color='b', label='t=' + str(round(tenors[i], 4)))
+    plt.axhline(y=0, color='k')
+    plt.xlabel('Log-Forward-Moneyness')
+    plt.ylabel('probability density function p(k)')
+    plt.legend()
+    plt.show()
+    
