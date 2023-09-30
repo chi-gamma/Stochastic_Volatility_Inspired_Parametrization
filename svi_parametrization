@@ -4,11 +4,12 @@ import numpy as np
 from scipy.stats import norm
 from scipy.special import ndtr
 from scipy.optimize import minimize
-import matplotlib.pyplot as plt
 from scipy import interpolate
+import matplotlib.pyplot as plt
+from matplotlib import cm
 
 
-def svi_raw(parameters, k):
+def svi_raw(parameters, k, g_func=False):
     """ SVI raw parametrization for total implied variance
     k: log forward moneyness for which total variance is evaluated
     
@@ -19,56 +20,28 @@ def svi_raw(parameters, k):
     :parameter sigma:   controls the ATM curvature of the smile
     """
     a, b, m, rho, sigma = parameters
-    w = a + b * (rho * (k - m) + np.sqrt((k - m)**2 + sigma**2))
+    term1 = (k - m)**2 + sigma**2
+    w = a + b * (rho * (k - m) + np.sqrt(term1))
+    if g_func:
+        w1 = b * (rho + (k - m) / (np.sqrt(term1)))
+        w2 = b * sigma**2 / term1**1.5
+        g = (1 - 0.5 * (k * w1 / w))**2 - (0.25 * w1**2) * ((1 / w) + 0.25) + 0.5 * w2
+        return w, g
     return w
 
 
-def svi_der_1(parameters, k):
-    """ 
-    first order derivative of the SVI raw total implied variance w.r.t  k
-    
-    """
-    a, b, m, rho, sigma = parameters
-    der = b * ( rho + (k - m) / ( np.sqrt((k - m)**2 + sigma**2) ) )
-    return der
-
-
-def svi_der_2(parameters, k):
-    """ 
-    second order derivative of the SVI raw total implied variance w.r.t  k
-    
-    """
-    a, b, m, rho, sigma = parameters
-    numer = b * sigma**2
-    denom = ((k - m)**2 + sigma**2)**1.5
-    der = numer / denom
-    return der
-    
-    
-def g_function(parameters, k):
-    """ 
-    key function to determine butterfly arbitrage 
-    
-    """
-    w = svi_raw(parameters, k)
-    w1 = svi_der_1(parameters, k)
-    w2 = svi_der_2(parameters, k)
-    g = (1 - 0.5 * (k * w1 / w))**2 - (0.25 * w1**2) * ((1 / w) + 0.25) + 0.5 * w2
-    return g, w
-
-
-def density_function(parameters, k):
+def density_function(raw_parameters, k):
     """ 
     Risk-Neutal Probability Density Function 
     
     """
-    g, w = g_function(parameters, k)
+    w, g = svi_raw(raw_parameters, k, g_func=True)
     d2 = -k / np.sqrt(w) - np.sqrt(w) / 2
     density = g / np.sqrt(2 * np.pi * w) * np.exp(-0.5 * d2**2)
     return density
 
 
-def svi_natural(parameters, k):
+def svi_natural(parameters, k, g_func=False):
     """ SVI natural parametrization for total implied variance
     k: log forward moneyness for which total variance is evaluated
     
@@ -79,31 +52,38 @@ def svi_natural(parameters, k):
     :parameter zeta:
     """
     delta, mu, rho, omega, zeta = parameters
-    w = delta + (omega / 2) * (1 + zeta * rho * (k-mu)) + np.sqrt((zeta * (k - mu) + rho)**2 + (1 - rho**2))
+    term1 = 1 + zeta * rho * (k - mu)
+    term2 = (zeta * (k - mu) + rho)**2 + (1 - rho**2)
+    w = delta + 0.5 * omega * (term1 + np.sqrt(term2))
+    if g_func:
+        w1 = 0.5 * omega * (zeta * rho + (zeta**2 * (k - mu) + zeta * rho) / np.sqrt(term2))
+        w2 = (omega * zeta**2 * (1 - rho**2)) / (2 * term2**1.5)
+        g = (1 - 0.5 * (k * w1 / w))**2 - (0.25 * w1**2) * ((1 / w) + 0.25) + 0.5 * w2
+        return w, g
     return w
 
 
-def convert_natural_to_raw(parameters_natural):
+def convert_natural_to_raw(natural_parameters):
     """ 
     Converts SVI natural parameters to SVI raw parameters
     
     """
-    delta, mu, rho, omega, zeta = parameters_natural
+    delta, mu, rho, omega, zeta = natural_parameters
     
     a = delta + (omega / 2) * (1 - rho**2)
     b = (omega * zeta) / 2
     m = mu - (rho / zeta)
     sigma = np.sqrt(1 - rho**2) / zeta
-    parameters_raw = np.array([a, b, m, rho, sigma])
-    return parameters_raw
+    raw_parameters = np.array([a, b, m, rho, sigma])
+    return raw_parameters
 
 
-def convert_raw_to_natural(parameters_raw):
+def convert_raw_to_natural(raw_parameters):
     """ 
     Converts SVI natural parameters to SVI raw parameters
     
     """
-    a, b, m, rho, sigma = parameters_raw
+    a, b, m, rho, sigma = raw_parameters
     zeta = np.sqrt(1 - rho**2) / sigma
     omega = (2 * b * sigma) / np.sqrt(1 - rho**2)
     mu = m + (rho * sigma) / np.sqrt(1 - rho**2)
@@ -112,7 +92,7 @@ def convert_raw_to_natural(parameters_raw):
     return parameters_natural
 
 
-def svi_jump_wings(parameters, k, t):
+def svi_jump_wings(parameters, k, t, g_func=False):
     """ SVI Jump-Wings parametrization for total implied variance
     k: log forward moneyness for which total variance is evaluated
     t: the time slice
@@ -124,7 +104,11 @@ def svi_jump_wings(parameters, k, t):
     :parameter v_tilde: The minimum implied variance
     """
     raw_parameters = convert_jumpwing_to_raw(parameters, t)
-    w = svi_raw(raw_parameters)
+    res = svi_raw(raw_parameters, k, g_func)
+    if g_func:
+        w, g = res
+        return w, g
+    w = res
     return w
 
 
@@ -149,6 +133,8 @@ def convert_jumpwing_to_raw(parameters_jw, t):
     Converts SVI Jump-Wings parameters to SVI raw parameters  for a given time slice t
     
     """
+    parameters_jw = np.array(parameters_jw)
+    parameters_jw = parameters_jw.reshape(-1, 1) if parameters_jw.ndim==1 else parameters_jw
     v, psi, p, c, v_tilde = parameters_jw
     w = v * t
     b = np.sqrt(w) / 2 * (c + p)
@@ -165,44 +151,74 @@ def convert_jumpwing_to_raw(parameters_jw, t):
     return parameters_raw
 
 
-def expand_jw_parameters(parameters):
+def repick_jw_parameters(parameters):
     """ 
     modifies the call wing (c) and the minimum variance (v_tilde) of SVI-jump-wings parameters
     to get a smile guaranteed to be free of butterfly arbitrage
     
     """
-    p4 = parameters[2] + 2 * parameters[1]
-    p5 = parameters[0] * 4 * parameters[2] * p4 / (parameters[2] + p4)**2
-    parameters = np.append(parameters[:3], [p4, p5])
+    p1, p2, p3 = parameters[:3]
+    p4 = p3 + 2 * p2
+    p5 = p1 * 4 * p3 * p4 / (p3 + p4)**2
+    parameters = np.array([p1, p2, p3, p4, p5])
     return parameters
 
 
-def black_scholes_model(S, K, T, r, q, sigma, phi, vega=False):
+def covert_ssvi_to_jumpwings(ssvi_params, t):
+    """ 
+    Converts SSVI parametrized in the natural space to jump-wings parameters     
     """
-    Black-Scholes function for valuing vanilla european options
+    _, _, rho, theta, phi = ssvi_params
+    v = theta / t
+    psi = 0.5 * rho * np.sqrt(theta) * phi
+    p = 0.5 * (1 - rho) * np.sqrt(theta) * phi
+    c = 0.5 * (1 + rho) * np.sqrt(theta) * phi
+    v_tilde = v * (1 - rho**2)
+    return np.array([v, psi, p, c, v_tilde])
+
+
+def power_law(parameters, theta):
+    """
+    Power law parametrization of phi in the SSVI function
+    
+    """
+    gamma = 0.5
+    rho, eta = parameters
+    val = eta / ((theta**gamma) * (1.0 + theta)**(1.0 - gamma))
+    return val
+
+
+def black_model(F, K, T, df, sigma, phi, calc_vega=False):
+    """
+    Black model for valuing vanilla european options
     input: point values or vectors
     phi: takes on either 1 or -1
         phi = 1 for call options and -1 for put options
-    vega: bool
+    calc_vega: bool
         determines if the function returns the vega in addition to the price
     """
-    d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / np.maximum(0.0005, (sigma * np.sqrt(T)))
+    d1 = (np.log(F / K) + (0.5 * sigma**2 * T)) / (sigma * np.sqrt(T))
     d2 = d1 - (sigma * np.sqrt(T))
-    val = phi * ( S * np.exp(-q * T) * ndtr(phi * d1) - (K * np.exp(-r * T) * ndtr(phi * d2)) )
-    if vega:
-        vg = S * norm._pdf(d1) * np.sqrt(T)
+    val = df * phi * (F * ndtr(phi * d1) - K * ndtr(phi * d2))
+    if calc_vega:
+        vg = df * F * norm._pdf(d1) * np.sqrt(T)
         return val, vg
     return val
 
 
-def implied_volatility(opt_prcs, S, Ks, T, r, q, phis):
+def implied_volatility(opt_prcs, F, Ks, T, df, phis):
+    """
+    Calculates the implied volatility of a block of vanilla options using the Black model
+    phis: vector that contains either 1 or -1
+        phis[i] = 1 for call options and -1 for put options
+    """
     data = np.column_stack((opt_prcs, Ks, phis))
     inds = np.arange(0, len(data), dtype=np.int32)
     ivs = np.zeros(len(phis))
     sigmas_est = 0.5 * np.ones(len(phis)) # start guess
     max_iter = 50
     for i in range(max_iter):
-        prc_est, vega = black_scholes_model(S, data[:,1], T, r, q, sigmas_est, data[:,2], vega=True)
+        prc_est, vega = black_model(F, data[:,1], T, df, sigmas_est, data[:,2], calc_vega=True)
         diff = data[:,0] - prc_est
         goal_flag = abs(diff) < 1e-5
         if np.any(goal_flag):
@@ -211,202 +227,474 @@ def implied_volatility(opt_prcs, S, Ks, T, r, q, phis):
             inds = inds[~goal_flag]
             data = data[~goal_flag]
             sigmas_est = sigmas_est[~goal_flag] + (diff[~goal_flag] / vega[~goal_flag])
-            
         else:
             sigmas_est = sigmas_est + (diff / vega)
     if len(sigmas_est)!=0: ivs[inds] = sigmas_est
     return ivs
 
 
-# objective function to determine the forward prices and discount factors
-def fwds_obj_func(params, data, df):
-    fwd = params
-    i_fit = df * (fwd - data['strike'].values)
-    error = np.sum( (i_fit - data['i_mid'].values)**2 )
-    return error
 
-
-
-# objective function to calibrate raw svi parametrization to market implied volatilities
-def svi_obj_fun(x0, ks, observed_vols, t):
-    ws = svi_raw(x0, ks)
-    model_vols = np.sqrt(ws / t)
-    diff = np.sum((model_vols - observed_vols)**2)
-    return diff
-
-
-# butterfly arbitrage constraint function
-def butterfly_constr(params):
-    """ a slice is free of butterfly arbitrage if the corresponding density is non-negative"""
-    gs, _ = g_function(params, standard_ks)
-    return gs
-
-
-# calendar spread arbitrage constraint function
-def calendar_constr(params, prev_parameters=None):
+def pre_process_option_chain(option_chains):
     """ 
-    a volatility surface is free of calendar spread arbitrage if there are no
-    crossed lines on a total variance plot
+    processes the options chain data from yahoo finance 
     """
-    if prev_parameters is None: return np.zeros(len(standard_ks))
-    diff = svi_raw(params, standard_ks) - svi_raw(prev_parameters, standard_ks)
-    return diff
+    calls, puts = option_chains[0].copy(), option_chains[1].copy()
+    # process calls
+    calls = calls[(calls[['bid','ask']] != 0).all(axis=1)]
+    calls['mid_call'] = 0.5 * (calls['bid'] + calls['ask'])
+    calls = calls[calls['mid_call'] > 0.5]
+    calls['option type'] = 'CALL'
+    calls['Per_Mon'] = (S0 - calls['strike']) / calls['strike']
+    # process puts
+    puts = puts[(puts[['bid','ask']] != 0).all(axis=1)]
+    puts['mid_put'] = 0.5 * (puts['bid'] + puts['ask'])
+    puts = puts[puts['mid_put'] > 0.5]
+    puts['option type'] = 'PUT'
+    puts['Per_Mon'] = (puts['strike'] - S0) / puts['strike']
+    return calls, puts
 
 
-# function to run the optimization
-def run_opt(x0, ks, observed_vols, t, cons, bnds):
-    res = minimize(svi_obj_fun, x0, args=(ks, observed_vols, t), 
-                   method='SLSQP', bounds=bnds, constraints=cons)
+def get_fwd(calls, puts, tenor):
+    """ 
+    calculates the forward prices and discount factors 
+    implied by option prices by a optimization routine
+    
+    """
+    
+    def obj_func(params, data):
+        df, fwd = params
+        i_fit = df * (fwd - data['strike'].values)
+        error = np.sum( (i_fit - data['i_mid'].values)**2 )
+        return error
+    
+    opts = calls.merge(puts, on='strike')[['strike', 'mid_call', 'mid_put']]
+    opts['i_mid'] = opts['mid_call'] - opts['mid_put']
+    if len(opts) < 4: return None
+    opts = opts.sort_values(by='i_mid', key=abs, ignore_index=True)[:6] 
+    x0 = [1, np.mean(opts['i_mid'] + opts['strike'])]
+    res = minimize(obj_func, x0, args=(opts), method='L-BFGS-B')
+    df, fwd = res.x
+    return df, fwd
+
+
+def get_imp_vol_and_vega(calls, puts, F, t, df):
+    """ 
+    processes the option chain and appends the
+    implied volatilities and option vegas
+    
+    """
+    
+    calls = calls.rename(columns={'mid_call' : 'mid'})
+    puts = puts.rename(columns={'mid_put' : 'mid'})
+    option_data = pd.concat([calls, puts])
+    # select only OTM options
+    option_data = option_data.loc[~(option_data['Per_Mon'] > 0)]
+    option_data['tenor'] = t
+    option_data['forward'] = F
+    if (len(option_data)) < 4: return None
+    # calculate implied volatility
+    option_data = option_data.sort_values(by=['strike']).reset_index(drop=True)
+    phis = np.where(option_data['option type']=='CALL', 1, -1)        
+    option_data['IV'] = implied_volatility(option_data['mid'].values, F, option_data['strike'].values, t, df, phis)
+    option_data.replace([np.inf, -np.inf], np.nan, inplace=True)
+    option_data = option_data.dropna(subset=['IV'], how='any', axis=0).reset_index(drop=True)
+    phis = np.where(option_data['option type']=='CALL', 1, -1) 
+    _, vegas = black_model(F, option_data['strike'].values, t, df, option_data['IV'].values, phis, calc_vega=True)
+    option_data['vega'] = vegas
+    return option_data[['strike', 'mid', 'option type', 'forward', 'tenor', 'IV', 'vega']]
+
+
+def butterfly_arbitrage_removal(jw_params, k, t, mkt_vols, standard_k, vegas=None):
+    """ 
+    Removes butterfly arbitrage from a smile in the jump-wings parametrization space by
+    repicking the right (call) slope and the minimum implied variance parameters
+    to get a smile that is free of butterfly arbitrage and is as close as possible to
+    the original smile
+    
+    """
+    if vegas is None: vegas = np.ones(len(k))
+    repicked_jw_params = repick_jw_parameters(jw_params) # guaranteed to be arbitrage free
+    x0 = repicked_jw_params[-2:]
+    bnds = ( tuple(sorted([jw_params[-2:][0], repicked_jw_params[-2:][0]])),
+    tuple(sorted([jw_params[-2:][1], repicked_jw_params[-2:][1]])) )
+    
+    def obj_func(x0, params):
+        params = np.append(params[:3], x0)
+        svi_vols = np.sqrt(svi_jump_wings(params, k, t) / t)
+        diff = np.linalg.norm(vegas * (mkt_vols - svi_vols) )
+        return diff
+    
+    con = {'type': 'ineq', 'fun': 
+           lambda x: svi_jump_wings(np.append(jw_params[:3], x), standard_k, t, g_func=True)[1] - 1e-8}
+    cons = [con,]
+    res = minimize(obj_func, x0, args=(jw_params), method='SLSQP', constraints=cons, bounds=bnds)
+    jw_params = np.append(jw_params[:3], res.x)
+    return jw_params
+
+
+def calibrate_svi_raw(k, t, mkt_vols, standard_k, vegas=None, init_guess=None):  
+    """ 
+    finds optimal arbitrage free raw SVI parameters that fit martet prices
+    
+    """
+    # objective function for calibration
+    def obj_func(x0):
+        svi_vols = np.sqrt(svi_raw(x0, k) / t)
+        diff = np.linalg.norm( vegas * (mkt_vols - svi_vols) )
+        return diff
+    if vegas is None: vegas = np.ones(len(k))
+    bnds = [(1e-5, t * max(mkt_vols)**2), (1e-3, 0.5), (2 * min(k), 2 * max(k)), (-1, 1), (1e-2, 1)]
+    con = {'type': 'ineq', 'fun': lambda x: svi_raw(x, standard_k, g_func=True)[1]-1e-8}
+    cons = [con,]
+    if init_guess is None:
+        # sample initial guess
+        params_arr = []
+        diffs = []
+        N = 20
+        for j in range(N):
+            x0 = [0.5 * np.sqrt(min(mkt_vols)/t)] + [np.random.uniform(bnd[0], bnd[1]) for bnd in bnds[1:]]
+            res = minimize(obj_func, x0, method='SLSQP', bounds=bnds, constraints=cons)
+            params_arr.append(res.x)
+            diffs.append(res.fun)
+        raw_params = params_arr[np.argmin(diffs)]
+    else:
+        res = minimize(obj_func, init_guess, method='SLSQP', bounds=bnds, constraints=cons)
+        raw_params = res.x
+    return raw_params
+
+
+def calibrate_ssvi(thetas, k_data, vol_data, vegas, tenors):
+    """ 
+    finds optimal arbitrage free SSVI parameters that fit martet prices
+    
+    """
+    ssvi_params = np.zeros((len(tenors),5))
+    def ssvi_obj_func(params):
+        rho = params[0]
+        diff = 0
+        for i in range(len(tenors)):
+            theta = thetas[i]
+            phi = power_law(params, theta)
+            ssvi_param = [0, 0, rho, theta, phi]
+            ssvi_params[i] = ssvi_param
+            k = k_data[i]
+            mkt_vols = vol_data[i]
+            vega = vegas[i]
+            ssvi_vols = svi_natural(ssvi_param, k)
+            diff += np.linalg.norm(vega * (mkt_vols - ssvi_vols))
+        return diff
+    cons = {'type': 'ineq', 'fun': lambda x: 2 - x[1] * (1 + abs(x[0]))}
+    bnds = ((-1,1), (0., None))
+    x0 = np.array([-0.6, 0.6])
+    res = minimize(ssvi_obj_func, x0, constraints=cons, method='trust-constr', bounds=bnds) 
     return res.x
 
 
-def read_discount_curve(path):
-    """
-    reads the discount curve and returns a loglinear interpolation function
+def calibrate_extended_ssvi(k_data, vol_data, tenors, standard_k):
+    """ 
+    finds optimal arbitrage free eSSVI parameters that fit martet prices
     
     """
-    disc_curve = pd.read_excel(path)
-    ts = np.insert(disc_curve['Tenor'].values, 0, 0., axis=0)
-    dfs = np.insert(disc_curve['DF'].values, 0, 1., axis=0)
-    return interpolate.interp1d(ts, np.log(dfs), kind='linear', fill_value='extrapolate')
+    def psi_fun(psi, rho, k_star, theta_star, ks, vols_mkt, t):
+        theta = theta_star - (rho * psi * k_star)
+        phi = psi / theta
+        e_ssvi_param = [0, 0, rho, theta, phi]
+        vols_model = np.sqrt(svi_natural(e_ssvi_param, ks) / t)
+        diff = np.linalg.norm(vols_mkt - vols_model)
+        return diff
+        
+    def psi_plus(rho, k_star, theta_star):
+        val = (-2 * rho * k_star / (1 + abs(rho))) + np.sqrt((4 * rho**2 * k_star**2 / (1 + abs(rho))**2) + (4 * theta_star / (1 + abs(rho))))
+        return val 
+    
+    def psi_minus(rho, psi_p, rho_p):
+        val = max( (psi_p - rho_p * psi_p) / (1 - rho), (psi_p + rho_p * psi_p) / (1 + rho) )
+        return val   
+        
+    def get_psi_given_rho(rho, i, k_s, theta_s, k, t, mkt_vols, e_ssvi_params):    
+        # butterfly arbitrage constraints
+        upper_bound = min( psi_plus(rho, k_s, theta_s), (4 / (1 + abs(rho))) )
+        lower_bound = 0
+        if i==0:
+            # positive theta constraints
+            if rho * k_s > 0: upper_bound = min( theta_s / (rho * k_s) , upper_bound)
+            if rho * k_s < 0: lower_bound = max( theta_s / (rho * k_s) , lower_bound)
+        else:
+            # calendar spread arbitrage constraints
+            _, _, rho_p, theta_p, phi_p = e_ssvi_params[i-1]
+            psi_p = phi_p * theta_p 
+            lower_bound = max(psi_p , lower_bound)
+            lower_bound = max(psi_minus(rho, psi_p, rho_p) , lower_bound)
+            if rho * k_s < 0:
+                lower_bound = max((theta_s - theta_p) / (rho * k_s) , lower_bound)
+            if rho * k_s > 0:
+                upper_bound = min((theta_s - theta_p) / (rho * k_s) , upper_bound)
+        x0 = 0.5 * (lower_bound + upper_bound)
+        bnds = ((lower_bound, upper_bound),)
+        res = minimize(psi_fun, x0, args=(rho, k_s, theta_s, k, mkt_vols, t), method='Powell', bounds=bnds)
+        return res
+    
+    e_ssvi_params = np.zeros((len(tenors), 5))
+    for i in range(len(tenors)):
+        k, t, mkt_vols  = k_data[i], tenors[i], vol_data[i]
+        # get point at or closest to the ATMF
+        idx = (np.abs(k - 0)).argmin()
+        k_s, theta_s = k[idx], t * mkt_vols[idx]**2
+        # sample rho within the valid interval and get the rho with the lowest error
+        N = 20
+        errors, rhos = [], []
+        for j in range(N):
+            rho = np.random.uniform(-0.999999, 0.999999)
+            res = get_psi_given_rho(rho, i, k_s, theta_s, k, t, mkt_vols, e_ssvi_params)
+            rhos.append(rho)
+            errors.append(res.fun)
+        min_ind = np.argmin(errors)
+        rho1 = rhos[min_ind]
+        # sample rho within a smaller interval of the first sampling and get the rho with the lowest error
+        errors, rhos, psis = [], [], []
+        for j in range(N):
+            rho = np.random.uniform( low=max(-0.999999, rho1-0.15), high=min(0.999999, rho1+0.15) )
+            res = get_psi_given_rho(rho, i, k_s, theta_s, k, t, mkt_vols, e_ssvi_params)
+            rhos.append(rho)
+            errors.append(res.fun)
+            psis.append(res.x[0])
+        min_ind = np.argmin(errors)
+        rho = rhos[min_ind]
+        psi = psis[min_ind]
+        theta = theta_s - (rho * psi * k_s)
+        phi = psi / theta
+        e_ssvi_params[i] = [0, 0, rho, theta, phi]
+        # plot volatility fit and g-function
+        v_ssvi = np.sqrt(svi_natural(e_ssvi_params[i], k) / t)
+        g = svi_natural(e_ssvi_params[i], standard_k, g_func=True)[1]
+        fig, (ax1, ax2) = plt.subplots(2)
+        ax1.plot(k, v_ssvi, c='red', label='eSSVI')
+        ax1.scatter(k, mkt_vols, color='blue', label='market')
+        ax1.set_ylabel('Volatility')
+        ax1.legend(loc='upper right')    
+        ax2.plot(standard_k, g, color='red')
+        ax2.axhline(y=0, color='k')
+        ax2.set_ylabel('g-function (g(k)')
+        fig.suptitle('Tenor=' + str(round(t, 3)))
+        plt.show()
+    return e_ssvi_params
 
 
-# Get Option-Chain Data
+def interpolate_e_ssvi(t, tenors, e_ssvi_params):
+    """
+    arbitrage free interpolation and extrapolation of eSSVI slices
+
+    """
+    rhos = e_ssvi_params[:,2]
+    thetas = e_ssvi_params[:,3]
+    phis = e_ssvi_params[:,4]
+    psis = phis * thetas
+    if t < tenors[0]:
+        # short term extrapolation
+        lamda = t / tenors[0]
+        interp_params = np.copy(e_ssvi_params[0])
+        interp_params[3] *= lamda
+    elif t > tenors[-1]:
+        # long term extrapolation
+        interp_params = np.copy(e_ssvi_params[-1])
+        f = interpolate.interp1d(tenors, thetas, kind='linear', fill_value='extrapolate')
+        theta = f(t)
+        phi = (interp_params[3] * interp_params[4]) / theta
+        interp_params[3] = theta
+        interp_params[4] = phi
+    else:
+        # interpolation
+        theta = np.interp(t, tenors, thetas)
+        psi = np.interp(t, tenors, psis)
+        rho = np.interp(t, tenors, rhos * psis) / psi
+        interp_params = np.array([0, 0, rho, theta, psi / theta])
+    return interp_params
+
+
+#========================================= Get Option-Chain Data=====================================#
+
+print('\n--------- pulling option data from Yahoo Finance ----------')
 today = pd.to_datetime('today').normalize()
 ticker = '^SPX'
 S0 = yf.Ticker(ticker).fast_info['lastPrice']
 exp_dates = yf.Ticker(ticker).options
-tenors = []
+exp_tenors = np.array([])
 
-option_data = pd.DataFrame()
-for i in range(len(exp_dates)):
-    date = exp_dates[i]
-    option_chains = yf.Ticker(ticker).option_chain(date)
-    calls = option_chains[0]
-    calls['Option Type'] = 'CALL'
-    calls['Per_Mon'] = (S0 - calls['strike']) / calls['strike']
-    puts = option_chains[1]
-    puts['Option Type'] = 'PUT'
-    puts['Per_Mon'] = (puts['strike'] - S0) / puts['strike']
-    total_data = pd.concat([calls, puts])
-    total_data = total_data[['Option Type', 'strike', 'Per_Mon', 'lastPrice', 'bid', 'ask', 'impliedVolatility']]
+total_data = []
+for i in range(len(exp_dates)): #in calib_inds:  #range(len(exp_dates)):
     tenor = (pd.to_datetime(exp_dates[i]) - today).days / 365
-    tenors.append(tenor)
-    total_data['Tenor'] = tenor
-    option_data = pd.concat([option_data, total_data], ignore_index=True)
-option_data = option_data.rename(columns={'impliedVolatility' : 'yf_IV'})    
-    
+    if tenor <= 0: continue
+    option_chains = yf.Ticker(ticker).option_chain(exp_dates[i])
+    calls, puts = pre_process_option_chain(option_chains)
+    val = get_fwd(calls, puts, tenor)
+    if val is None: continue
+    df, fwd = val
+    option_data = get_imp_vol_and_vega(calls, puts, fwd, tenor, df)
+    if option_data is None: continue
+    exp_tenors = np.append(exp_tenors, tenor)
+    total_data.append(option_data)
+print('\n--------- done retrieving option data from Yahoo Finance ----------')
 
-# drop rows with zero bid or zero ask or both
-option_data = option_data[(option_data[['bid','ask']] != 0).all(axis=1)]
-
-# calculate average option price
-option_data['mid'] = (option_data['bid'] + option_data['ask']) / 2
-
-# drop rows with average price less than 50 cents
-option_data = option_data[option_data['mid'] > 0.5] 
-
-
-path = 'discount_curve.xlsx'
-log_df_interp = read_discount_curve(path)
-
-
-tenors = option_data['Tenor'].unique()
-tenors = tenors[tenors > 0]
-svi_bnds_dict = {}
-k_arr_dict = {}
-guesses_dict = {}
-vols_dict = {}
-n_tenors = np.array([])
-for i in range(len(tenors)):
-    t = tenors[i]
-    t_data = option_data[option_data['Tenor']==t]
-    # interpolate discount factor and find the forward price
-    df = np.exp(log_df_interp(t))
-    temp_c = t_data[t_data['Option Type']=='CALL'].rename(columns={'mid' : 'mid_call'})
-    temp_p = t_data[t_data['Option Type']=='PUT'].rename(columns={'mid' : 'mid_put'})
-    temp = temp_p.merge(temp_c, on='strike')[['strike', 'mid_call', 'mid_put']]
-    temp['i_mid'] = temp['mid_call'] - temp['mid_put']
-    if len(temp) < 4: continue
-    temp = temp.sort_values(by='i_mid', key=abs, ignore_index=True)[:6]    
-    fwd_guess = np.mean(temp['i_mid'] + temp['strike'])
-    res = minimize(fwds_obj_func, x0=fwd_guess, args=(temp, df))
-    fwd = res.x[0]
-    r = np.log(df) / -t # risk-free rate
-    q = (np.log(df) / -t) - np.log(fwd / S0) / t # dividend yield
-    # select only OTM options
-    temp = t_data.loc[~(t_data['Per_Mon'] > 0)].reset_index(drop=True)
-    if (len(temp)) < 3: continue
-    # calculate implied volatility
-    temp = temp.sort_values(by=['strike']).reset_index(drop=True)
-    phis = np.ones(len(temp))
-    phis[temp[temp['Option Type']=='PUT'].index] = -1        
-    temp['IV'] = implied_volatility(temp['mid'].values, S0, temp['strike'].values, t, r, q, phis)
-    temp.replace([np.inf, -np.inf], np.nan, inplace=True)
-    temp = temp.dropna(subset=['IV'], how='any', axis=0).reset_index(drop=True)
-    temp['w'] = t * temp['IV']**2
-    n_tenors = np.append(n_tenors, t)
-    # Get SVI inputs for calibration
-    k_arr_dict[t] = np.log(temp['strike'].values / fwd)
-    vols_dict[t] = temp['IV'].values
-    svi_bnds_dict[t] = [(1e-5, temp['w'].max()), (1e-3, 1), (-3, 3), (-1, 1), (1e-2, 1)]
-    guesses_dict[t] = [0.5 * t * temp['IV'].min()**2, 0.1, 0.1, -0.5, 0.1]
-    
-
-# filter out tenors close to 1W, 1M, 3M, 6M, 1Y, 2Y, 3Y, 4Y
+  
+# filter out the data close to standard tenors
 std_tenors = np.array([0.0192, 0.0833, 0.25, 0.5, 1, 2, 3, 4, 5])
-temp = list(k_arr_dict.keys())
-tenors = []
+k_data, vol_data, tenors, vegas = [], [], [], []
+idx_init = -1
 for i in range(len(std_tenors)):
-    idx = (np.abs(n_tenors - std_tenors[i])).argmin()
-    if not n_tenors[idx] in tenors: tenors.append(n_tenors[idx])
-    
+    idx = (np.abs(exp_tenors - std_tenors[i])).argmin()
+    if idx != idx_init:
+        temp = total_data[idx]
+        tenors.append(temp.loc[0, 'tenor'])
+        vol_data.append(temp['IV'].values)
+        vegas.append(temp['vega'].values)
+        k_data.append(np.log( temp['strike'].values / temp.loc[0, 'forward'] ))
+        idx_init = idx
     
 
-# calibrate slice from the lowest tenor up, with constraints for butterfly and calendar spread arbitrage
-svi_params = np.zeros((len(tenors), 5))
-standard_ks = np.linspace(-1.5, 1.5, 20)
+#================================================ SVI Raw ============================================#
+standard_k = np.linspace(-1.5, 1.5, 17)
 
+
+# calibrate each SVI slice and plot results 
+raw_parameter_array = []   
 for i in range(len(tenors)):
+    k = k_data[i]
     t = tenors[i]
-    bnds = tuple(svi_bnds_dict[t])
-    ks = k_arr_dict[t]
-    observed_vols = vols_dict[t]
-    x0 = guesses_dict[t]
-    prev_parameters = svi_params[i-1] if i != 0 else None
-    cons=({'type': 'ineq', 'fun': butterfly_constr}, 
-        {'type': 'ineq', 'fun': calendar_constr, 'args': (prev_parameters,)})
-    #prev_params = svi_params[i-1] if i != 0 else None
-    for j in range(2):
-        x0 = run_opt(x0, ks, observed_vols, t, cons, bnds)
-    svi_params[i] = x0
-    model_vols = np.sqrt( svi_raw(svi_params[i], ks) / t )
-    plt.plot(ks, observed_vols, 'bo', label='observed')
-    plt.plot(ks, model_vols, 'r--', label='SVI-model')
-    plt.xlabel('Log-Forward-Moneyness')
-    plt.ylabel('volatility')
-    plt.title('t = ' + str(round(tenors[i], 4)))
-    plt.grid()
-    plt.legend()
+    mkt_vols = vol_data[i]
+    vega = vegas[i] 
+    raw_params = calibrate_svi_raw(k, t, mkt_vols, standard_k, vega)
+    g = svi_raw(raw_params, standard_k, g_func=True)[1]
+    if np.any(g < 0):
+        jw_params = convert_raw_to_jumpwing(raw_params, t)
+        jw_params = butterfly_arbitrage_removal(jw_params, k, t, mkt_vols, standard_k, vega)
+        raw_params = convert_jumpwing_to_raw(jw_params, t).squeeze()
+    raw_parameter_array.append(raw_params)
+    v_opt = np.sqrt(svi_raw(raw_params, k) / t)
+    g_opt = svi_raw(raw_params, standard_k, g_func=True)[1]
+    fig, (ax1, ax2) = plt.subplots(2)
+    ax1.plot(k, v_opt, c='red', label='Raw SVI')
+    ax1.scatter(k, mkt_vols, color='blue', label='market')
+    ax1.set_ylabel('Volatility')
+    ax1.legend(loc='upper right')
+    ax2.plot(standard_k, g_opt, c='red')
+    ax2.axhline(y=0, color='k')
+    ax2.set_ylabel('g-function (g(k)')
+    fig.suptitle('Tenor=' + str(round(t, 3)))
     plt.show()
+    
+#============================================ Surface SVI ===========================================#
+# Run SSVI calibration and plot
+thetas = [svi_raw(raw_parameter_array[i], 0) for i in range(len(raw_parameter_array))]
+opt_params = calibrate_ssvi(thetas, k_data, vol_data, vegas, tenors)
+rho = opt_params[0]
+ssvi_params = np.zeros((len(tenors),5))
 
 
-# plot total variances to check that there are no crossed lines
-total_variances = np.zeros((len(tenors), len(standard_ks)))
+# plot the volatlity fit and g-function
 for i in range(len(tenors)):
-    total_variances[i] = svi_raw(svi_params[i], standard_ks)
-    plt.plot(standard_ks, total_variances[i])
-plt.grid()
+    k, t, mkt_vols = k_data[i], tenors[i], vol_data[i]
+    theta = thetas[i]
+    phi = power_law(opt_params, theta)
+    ssvi_natural_param = [0., 0., rho, theta, phi]
+    ssvi_params[i] = ssvi_natural_param
+    v_ssvi = np.sqrt(svi_natural(ssvi_params[i], k) / t)
+    g = svi_natural(ssvi_params[i], standard_k, g_func=True)[1]
+    fig, (ax1, ax2) = plt.subplots(2)
+    ax1.plot(k, v_ssvi, c='red', label='SSVI')
+    ax1.scatter(k, mkt_vols, color='blue', label='market')
+    ax1.set_ylabel('Volatility')
+    ax1.legend(loc='upper right')    
+    ax2.plot(standard_k, g, color='red')
+    ax2.axhline(y=0, color='k')
+    ax2.set_ylabel('g-function (g(k)')
+    fig.suptitle('Tenor=' + str(round(t, 3)))
+    plt.show()
+    
+    
+# check that there are no crossed lines on the total variance plot (calendar spread arbitrage)
+for i in range(len(tenors)): 
+    w = svi_natural(ssvi_params[i], standard_k)
+    plt.plot(standard_k, w)
+plt.xlabel('log forward moneyness')
+plt.ylabel('total variance (w)')
+    
+
+
+# plot SSVI volatility surface
+ssvi_vol_surface = np.array([np.sqrt(svi_natural(ssvi_params[i], standard_k) / tenors[i]) 
+                             for i in range(len(tenors))])
+fig = plt.figure(figsize=(10,8))
+ax = fig.add_subplot(111, projection='3d')
+X, Y = np.meshgrid(standard_k, tenors)
+ax.plot_surface(X, Y, ssvi_vol_surface, cmap=cm.jet)
+ax.set_xlabel('Log-moneyness')
+ax.set_ylabel('Tenor')
+ax.set_zlabel('Volatility')
+ax.set_title('SSVI Volatility Surface')
 plt.show()
 
 
-# plot the g function for each time slice
-for i in range(len(tenors)):
-    gs,_ = g_function(svi_params[i], standard_ks)
-    plt.plot(standard_ks, gs, color='b', label='t=' + str(round(tenors[i], 4)))
-    plt.axhline(y=0, color='k')
-    plt.xlabel('Log-Forward-Moneyness')
-    plt.ylabel('probability density function p(k)')
-    plt.legend()
-    plt.show()
-    
+
+#================================== Extended SSVI Calibration =======================================#
+
+# run the calibration and get the parameters in the SVI Natural Space
+e_ssvi_params = calibrate_extended_ssvi(k_data, vol_data, tenors, standard_k)
+
+
+for i in range(len(tenors)): 
+    w = svi_natural(e_ssvi_params[i], standard_k)
+    plt.plot(standard_k, w)
+plt.xlabel('log forward moneyness')
+plt.ylabel('total variance (w)')
+
+
+# plot eSSVI volatility surface
+e_ssvi_vol_surface = np.array([np.sqrt(svi_natural(e_ssvi_params[i], standard_k) / tenors[i]) 
+                             for i in range(len(tenors))])
+fig = plt.figure(figsize=(10,8))
+ax = fig.add_subplot(111, projection='3d')
+X, Y = np.meshgrid(standard_k, tenors)
+ax.plot_surface(X, Y, ssvi_vol_surface, cmap=cm.jet)
+ax.set_xlabel('Log-moneyness')
+ax.set_ylabel('Tenor')
+ax.set_zlabel('Volatility')
+ax.set_title('eSSVI Volatility Surface')
+plt.show()
+
+
+      
+# plot a random interpolated total variance plot
+low_ind = np.random.randint(0, len(tenors) - 1)
+t = np.random.uniform(tenors[low_ind], tenors[low_ind + 1])
+interp = interpolate_e_ssvi(t, tenors, e_ssvi_params)  
+w1 = svi_natural(e_ssvi_params[low_ind], standard_k)
+w2 = svi_natural(e_ssvi_params[low_ind + 1], standard_k)
+w = svi_natural(interp, standard_k)
+plt.plot(standard_k, w1, label='slice1')
+plt.plot(standard_k, w2, label='slice2')
+plt.plot(standard_k, w, label='interpolated slice')
+plt.legend()
+plt.show()
+
+
+# plot a random short term extrapolated total variance plot
+t = np.random.uniform(1e-3, tenors[0])
+short_extrap = interpolate_e_ssvi(t, tenors, e_ssvi_params)
+w1 = svi_natural(e_ssvi_params[0], standard_k)
+w = svi_natural(short_extrap, standard_k)
+plt.plot(standard_k, w1, label='short term slice')
+plt.plot(standard_k, w, label='short extrapolated slice')
+plt.legend()
+plt.show()
+
+
+# plot a random long term extrapolated total variance plot
+t = np.random.uniform(tenors[-1], tenors[-1] + 2)
+long_extrap = interpolate_e_ssvi(t, tenors, e_ssvi_params)
+w1 = svi_natural(e_ssvi_params[-1], standard_k)
+w = svi_natural(long_extrap, standard_k)
+plt.plot(standard_k, w1, label='long term slice')
+plt.plot(standard_k, w, label='long extrapolated slice')
+plt.legend()
+plt.show()
+
